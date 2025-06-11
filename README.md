@@ -26,8 +26,8 @@ A utility to populate your local MySQL database using structured JSON dump files
    pip install -r requirements.txt
    ```
 
-3. **Update the `BEARER_TOKEN`**  
-   Set the valid token inside the script or using an environment variable if required by your API setup.
+3. **NOTE : Update the `BEARER_TOKEN`**  
+   Set the valid token inside the run.py script.
 
 ---
 
@@ -50,4 +50,4 @@ This will:
 ## 📝 Notes
 
 - Ensure your MySQL config (host, port, user, password, database) matches your local setup.
-- Dump files should be named `<table_name>.json` and placed under `dev-db-data/`.
+- Dump files should be named `<table_name>_dump.json` and placed under `dev-db-data/`.
