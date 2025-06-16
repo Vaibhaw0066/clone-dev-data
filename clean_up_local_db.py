@@ -1,3 +1,4 @@
+
 import os
 import json
 import logging
@@ -13,12 +14,8 @@ CONFIG = {
     "database": "cms_bike_backend"
 }
 DUMP_DIR = "dev-db-data"
-LOG_FILE = "restore_log.txt"
 
-# ---- LOGGING ----
-logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format="%(levelname)s:%(message)s")
-
-# ---- MYSQL CONNECTION ----
+# ---- DB CONNECTION ----
 def get_connection():
     return pymysql.connect(
         host=CONFIG["host"],
@@ -31,52 +28,11 @@ def get_connection():
         autocommit=True
     )
 
-# ---- FK DEPENDENCIES ----
-def get_foreign_key_dependencies():
-    query = """
-    SELECT TABLE_NAME, REFERENCED_TABLE_NAME
-    FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
-    WHERE TABLE_SCHEMA = %s AND REFERENCED_TABLE_NAME IS NOT NULL
-    """
-    dependencies = []
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(query, (CONFIG["database"],))
-            for row in cursor.fetchall():
-                dependencies.append((row["TABLE_NAME"], row["REFERENCED_TABLE_NAME"]))
-    return dependencies
-
-# ---- TOPOLOGICAL SORT ----
-def topological_sort(tables, dependencies):
-    graph = defaultdict(set)
-    in_degree = defaultdict(int)
-
-    for t in tables:
-        in_degree[t] = 0
-
-    for a, b in dependencies:
-        graph[b].add(a)
-        in_degree[a] += 1
-
-    queue = deque([t for t in tables if in_degree[t] == 0])
-    sorted_order = []
-
-    while queue:
-        node = queue.popleft()
-        sorted_order.append(node)
-        for neighbor in graph[node]:
-            in_degree[neighbor] -= 1
-            if in_degree[neighbor] == 0:
-                queue.append(neighbor)
-
-    if len(sorted_order) != len(tables):
-        raise Exception("Cycle detected in foreign key graph")
-
-    return sorted_order
-
-# ---- DATA LOADING ----
+# ---- UTILITY METHODS ----
 def load_dump_data(table):
-    file_path = os.path.join(DUMP_DIR, f"{table}.json")
+    file_path = os.path.join(DUMP_DIR, f"{table}_dump.json")
+    if not os.path.exists(file_path):
+        file_path = os.path.join(DUMP_DIR, f"{table}.json")
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -84,50 +40,166 @@ def load_dump_data(table):
         logging.error(f"❌ Failed to load dump for {table}: {e}")
         return []
 
-# ---- DATA INSERTION ----
+def insert_sql(cursor, table, row):
+    columns = row.keys()
+    placeholders = ", ".join(["%s"] * len(columns))
+    quoted_columns = ", ".join([f"`{col}`" for col in columns])
+    sql = f"INSERT INTO `{table}` ({quoted_columns}) VALUES ({placeholders})"
+    values = tuple(row[col] for col in columns)
+    try:
+        cursor.execute(sql, values)
+    except pymysql.MySQLError as e:
+        logging.error(f"❌ Insert failed for {table}: {e} — Row: {row}")
+
 def insert_data(table, data):
     if not data:
         logging.warning(f"⚠️  No data found for table: {table}")
         return
-
-    columns = data[0].keys()
-    placeholders = ", ".join(["%s"] * len(columns))
-    insert_sql = f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({placeholders})"
-
     try:
         with get_connection() as conn:
             with conn.cursor() as cursor:
-                cursor.execute(f"SET FOREIGN_KEY_CHECKS = 1;")
-                cursor.execute(f"TRUNCATE TABLE {table};")
-                for i in range(0, len(data), 20):  # batch size = 20
+                for i in range(0, len(data), 20):
                     batch = data[i:i + 20]
-                    values = [tuple(row[col] for col in columns) for row in batch]
-                    try:
-                        cursor.executemany(insert_sql, values)
-                    except pymysql.MySQLError as e:
-                        logging.error(f"❌ Insert failed for table {table} (batch {i}-{i+len(batch)}): {e}")
+                    for row in batch:
+                        insert_sql(cursor, table, row)
     except pymysql.MySQLError as e:
-        logging.error(f"❌ Unexpected failure for {table}: {e}")
+        logging.error(f"❌ Unexpected DB failure for {table}: {e}")
 
-# ---- MAIN EXECUTION ----
-def restore_all_tables():
-    dump_tables = [f[:-5] for f in os.listdir(DUMP_DIR) if f.endswith(".json")]
-    print(f"🔍 Found {len(dump_tables)} tables in dump.")
-
+def insert_model_in_two_passes(model_data):
+    if not model_data:
+        logging.warning("⚠️ No model data to insert.")
+        return
     try:
-        dependencies = get_foreign_key_dependencies()
-        sorted_tables = topological_sort(dump_tables, dependencies)
-    except Exception as e:
-        logging.error(f"❌ Topological sort failed: {e}")
-        sorted_tables = dump_tables  # fallback: unsorted
+        with get_connection() as conn:
+            with conn.cursor() as cursor:
+                for row in model_data:
+                    temp = row.copy()
+                    temp["nextModelId"] = None
+                    insert_sql(cursor, 'model', temp)
+                for row in model_data:
+                    if row.get("nextModelId"):
+                        try:
+                            cursor.execute(
+                                "UPDATE model SET nextModelId=%s WHERE id=%s",
+                                (row["nextModelId"], row["id"])
+                            )
+                        except pymysql.MySQLError as e:
+                            logging.error(f"❌ Failed to update nextModelId in model (id={row['id']}): {e}")
+    except pymysql.MySQLError as e:
+        logging.error(f"❌ DB failure during model 2-pass insert: {e}")
 
-    for table in sorted_tables:
-        print(f"📥 Restoring table: {table}")
+# ---- RESTORE ORDERS ----
+INSERT_ORDER = [
+    'media_folder',
+    'media_library',
+    'state',
+    'city',
+    'area',
+    'dealer',
+    'partner',
+    'makes',
+    'tag',
+    'model',
+    'variant',
+    'model_video',
+    'model_video_category',
+    'model_video_header',
+    'celebrity',
+    'model_celebrity',
+    'model_color_image',
+    'model_image',
+    'model_tags',
+    'awards',
+    'model_awards',
+    'model_spec',
+    'model_spec_image',
+    'widget_data',
+    'expert_review',
+    'fun_fact',
+    'modelGncap',
+    'thought',
+    'variant_tags',
+    'variant_car',
+    'price',
+    'dealer_makes',
+    'dealer_partner',
+    'make_tags',
+    'image_tags',
+    'user_review',
+    'user_review_image',
+    'social_review',
+    'social_review_comment',
+    'leads',
+    'schedule_lead',
+    'partner_lead',
+    'other_popular_makes',
+    'state_wise_make_registration',
+    'review_report',
+    'monthly_sales'
+]
+
+DELETE_ORDER = list(reversed(INSERT_ORDER))
+
+# ---- VERIFY ORDER ----
+def verify_insert_order(order):
+    position = {table: i for i, table in enumerate(order)}
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT TABLE_NAME, REFERENCED_TABLE_NAME
+                FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+                WHERE TABLE_SCHEMA = %s AND REFERENCED_TABLE_NAME IS NOT NULL
+            """, (CONFIG["database"],))
+            errors = []
+            for row in cursor.fetchall():
+                dependent = row["TABLE_NAME"]
+                referenced = row["REFERENCED_TABLE_NAME"]
+                if dependent in position and referenced in position:
+                    if position[dependent] < position[referenced]:
+                        errors.append(f"❌ {dependent} comes before its dependency {referenced}")
+            if errors:
+                print("🚨 Invalid INSERT_ORDER detected:")
+                for err in errors:
+                    print(err)
+            else:
+                print("✅ INSERT_ORDER is valid and FK-safe.")
+
+# ---- DELETE AND INSERT ----
+def delete_all_data_in_order():
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 0;")
+            for table in DELETE_ORDER:
+                try:
+                    logging.info(f"🚮 Deleting from table: {table}")
+                    cursor.execute(f"DELETE FROM `{table}`")
+                except Exception as e:
+                    logging.error(f"❌ Failed to delete from {table}: {e}")
+            cursor.execute("SET FOREIGN_KEY_CHECKS = 1;")
+
+def insert_all_data_in_order():
+    for table in INSERT_ORDER:
         data = load_dump_data(table)
-        insert_data(table, data)
+        logging.info(f"📥 Inserting into table: {table}")
+        if table == "model":
+            insert_model_in_two_passes(data)
+        else:
+            insert_data(table, data)
 
-    print("✅ Restoration process completed.")
+# ---- MAIN ENTRY ----
+def clean_and_restore(LOG_FILE):
+    logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    filemode='a'  # Always append
+)
 
-# ---- ENTRY POINT ----
-def clean_up_and_update_db_data():
-    restore_all_tables()
+    verify_insert_order(INSERT_ORDER)
+    delete_all_data_in_order()
+    insert_all_data_in_order()
+    print("✅ Database restoration completed successfully.")
+
+if __name__ == "__main__":
+    clean_and_restore()
